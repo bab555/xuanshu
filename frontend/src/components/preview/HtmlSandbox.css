@@ -1,0 +1,83 @@
+.html-sandbox {
+  background: var(--color-bg-secondary);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+}
+
+.sandbox-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  background: var(--color-bg-tertiary);
+  border-bottom: 1px solid var(--color-border);
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.sandbox-label {
+  font-weight: 500;
+}
+
+.sandbox-size {
+  opacity: 0.7;
+}
+
+.sandbox-frame {
+  width: 100%;
+  border: none;
+  background: white;
+  display: block;
+}
+
+.html-error {
+  background: var(--color-error-bg, #fef2f2);
+  border-color: var(--color-error, #dc2626);
+  padding: var(--spacing-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.html-error .error-icon {
+  font-size: 24px;
+}
+
+.html-error .error-message {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.html-error .error-message strong {
+  color: var(--color-error, #dc2626);
+}
+
+.html-error .error-message pre {
+  margin: 0;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.html-error .error-code {
+  margin-top: var(--spacing-sm);
+  font-size: 12px;
+}
+
+.html-error .error-code summary {
+  cursor: pointer;
+  color: var(--color-text-muted);
+}
+
+.html-error .error-code pre {
+  margin-top: var(--spacing-xs);
+  padding: var(--spacing-sm);
+  background: var(--color-bg-tertiary);
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+  font-size: 11px;
+}
+
