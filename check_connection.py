@@ -12,8 +12,8 @@ from app.config import settings
 
 async def test_full_link():
     print("=== 开始全链路联通自检 ===")
-    base_url = "http://127.0.0.1:8000"
-    ws_base_url = "ws://127.0.0.1:8000"
+    base_url = "http://127.0.0.1:8001"
+    ws_base_url = "ws://127.0.0.1:8001"
     
     # 1. 检查后端健康
     print(f"\n1. 检查后端健康 ({base_url}/health)...")
@@ -27,7 +27,7 @@ async def test_full_link():
                 return
     except Exception as e:
         print(f"   [FAIL] 无法连接后端: {e}")
-        print("   建议：请确保已在 backend 目录下运行 'uvicorn app.main:app --port 8000'")
+        print("   建议：请确保已在 backend 目录下运行 'uvicorn app.main:app --port 8001'")
         return
 
     # 2. 模拟登录

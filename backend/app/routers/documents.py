@@ -5,8 +5,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
-from typing import List
+from typing import List, Dict, Any
 from datetime import datetime
+from pydantic import BaseModel
 
 from app.database import get_db
 from app.models.user import User
@@ -314,7 +315,7 @@ from app.nodes.repair import run_repair
 class RepairRequest(BaseModel):
     errors: List[Dict[str, Any]] # [{"code": "...", "error": "...", "type": "mermaid"}]
 
-@router.post("/{doc_id}/repair", response_model=DocumentDetail)
+@router.post("/{doc_id}/repair", response_model=dict)
 async def repair_document(
     doc_id: str,
     req: RepairRequest,

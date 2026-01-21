@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     
     # ===== 服务配置 =====
     backend_host: str = "0.0.0.0"
-    backend_port: int = 8000
+    backend_port: int = 8001
     debug: bool = False
     
     # ===== 工作流 =====
