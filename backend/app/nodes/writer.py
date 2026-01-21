@@ -1,66 +1,91 @@
 """
-B：文档撰写节点（Writer）
+Writer 节点 (Execution Engine)
 
 职责：
-- 依据 doc_variables + 材料，撰写/润色文档主体
-- 输出 draft_md（允许内嵌 Mermaid/HTML 占位）
+- 接收 Skills 序列
+- 逐个执行 Skill (Search -> Write -> Image -> Chart)
+- 维护 Execution Context
+- 流式输出结果
 """
 import json
 import re
-from datetime import datetime
-from typing import Dict, Any, Optional, Callable, List, Tuple
 import asyncio
+from datetime import datetime
+from typing import Dict, Any, Optional, Callable, List
 
 from app.services.model_client import model_client
 from app.config import settings
+from app.schemas.workflow import Skill
 
-WRITER_SYSTEM_PROMPT = """你是红点集团内部文档工具的文档撰写助手。
+# --- Prompts ---
 
-根据提供的文档变量（doc_variables）和参考材料，撰写文档主体。
+WRITER_BASE_SYSTEM_PROMPT = """你是红点集团内部文档工具的【执行引擎】。
+你的任务是根据用户的指令（Skill Instruction）和上下文（Context）执行具体操作。
+"""
 
-输出格式要求：
-1. 使用 Markdown 格式
-2. 需要图表的地方，用占位标记：`{{MERMAID:图表描述}}` 或 `{{HTML:原型描述}}`
-3. 保持结构清晰，逻辑严谨
-4. 只根据提供的信息撰写，不要编造
-5. 目标是"说清楚一件事"，不追求华丽辞藻
+WRITER_TEXT_PROMPT_TEMPLATE = """
+【当前任务】：撰写文档内容
+【指令】：{instruction}
 
-你必须输出 JSON 格式：
-```json
-{
-  "draft_md": "完整的 Markdown 文档内容",
-  "mermaid_placeholders": [
-    {"id": "mermaid_1", "description": "流程图：用户注册流程"}
-  ],
-  "html_placeholders": [
-    {"id": "html_1", "description": "原型：登录页面布局"}
-  ],
-  "notes": "撰写说明（可选）"
-}
-```
+【上下文信息】：
+{context}
 
-占位标记示例：
-- `{{MERMAID:用户注册流程图}}` - 后续由图文助手生成实际 Mermaid 代码
-- `{{HTML:首页布局原型}}` - 后续由图文助手生成实际 HTML 代码"""
+【已写内容摘要】：
+{draft_summary}
 
-WRITER_STREAMING_SYSTEM_PROMPT = """你是红点集团内部文档工具的文档撰写助手（Qwen）。
+【要求】：
+1. 直接输出 Markdown 正文。
+2. 严格基于上下文信息撰写，不要编造数据。
+3. 如果指令要求插入图表或图片，请忽略（会有专门的 Skill 处理），你只负责文字。
+4. 保持风格专业、简洁。
+"""
 
-请根据文档变量（doc_variables）和参考材料，直接输出一份 Markdown 草稿正文（不要 JSON，不要代码块包裹 JSON）。
-如果你认为需要配图，可以在文中使用占位符：`{{image+提示词}}`（提示词要足够让文生图模型生成合适图片）；如果不需要图片，可以完全不使用。
-如需图表，直接输出 Mermaid 代码块（```mermaid ... ```）。
-如用户明确要求原型/界面示意/HTML，则可以输出 ```html``` 代码块，前端会自动渲染。
+SEARCH_PROMPT_TEMPLATE = """
+【当前任务】：根据搜索结果提取信息
+【搜索词】：{query}
+【搜索结果】：
+{search_results}
 
-要求：
-1. 结构清晰、逻辑严谨，目标是“说清楚一件事”
-2. 允许合理补全用户未指定的细节，但必须在文中用“【假设】/【建议】”标注
-3. 输出必须是 Markdown 正文（可以包含 Mermaid/HTML 代码块与 {{image+...}} 占位标记）"""
+【要求】：
+请根据搜索结果，总结出与"{purpose}"相关的关键信息。
+输出一段简练的摘要，这段摘要将被注入到后续的写作上下文中。
+"""
 
-MERMAID_PATTERN = re.compile(r"\{\{MERMAID:([^}]+)\}\}")
-HTML_PATTERN = re.compile(r"\{\{HTML:([^}]+)\}\}")
+CHART_PROMPT_TEMPLATE = """
+【当前任务】：生成 Mermaid 图表代码
+【指令】：{instruction}
+【图表类型】：{chart_type}
+【上下文数据】：
+{context}
 
+【要求】：
+1. 只输出 Mermaid 代码块 (```mermaid ... ```)。
+2. 确保语法正确，节点名称不要包含特殊字符。
+"""
+
+UI_PROMPT_TEMPLATE = """
+【当前任务】：生成 HTML 界面代码
+【指令】：{instruction}
+
+【要求】：
+1. 输出一段 HTML 代码块 (```html ... ```)。
+2. 使用 Tailwind CSS 进行样式设计（假设环境支持）。
+3. 仅输出 HTML 结构，不需要完整的 <html> 标签。
+"""
+
+IMAGE_GENERATION_TEMPLATE = """
+【当前任务】：生成图片占位符
+【提示词】：{prompt}
+【位置】：{placement}
+
+【要求】：
+请输出一个 Markdown 图片占位符，格式如下：
+![{prompt}](/storage/generated/placeholder.png)
+"""
+
+# --- Helper Functions ---
 
 def _to_dict(state: Any) -> Dict[str, Any]:
-    """将 state 统一转为 dict（兼容 Pydantic 模型和普通 dict）"""
     if hasattr(state, "model_dump"):
         return state.model_dump()
     if hasattr(state, "dict"):
@@ -69,390 +94,272 @@ def _to_dict(state: Any) -> Dict[str, Any]:
         return state
     return {}
 
-
-async def run(state: Any) -> Dict[str, Any]:
-    """
-    B：文档撰写节点
-    
-    输入：doc_variables、附件摘要
-    输出：draft_md、占位标记列表
-    """
-    # 统一转为 dict
-    s = _to_dict(state)
-    
-    doc_vars = s.get("doc_variables", {})
-    
-    # 检查是否有足够信息
-    # 放宽检查：只要有 doc_type/outline/plan_md 任一项，就可以开始撰写
-    if not doc_vars.get("doc_type") and not doc_vars.get("outline") and not doc_vars.get("plan_md"):
-        return {
-            **s,
-            "current_node": "writer",
-            "node_status": "fail",
-            "error": {
-                "error_type": "validation_failed",
-                "error_message": "文档信息不足，请先通过中控澄清需求（缺少 doc_type/outline/plan_md）",
-                "retry_guidance": "返回中控节点补充文档类型和大纲",
-            },
-        }
-    
-    # 构造 node_prompt_spec
-    prompt_spec = {
-        "node_type": "writer",
-        "goal": f"撰写文档：{doc_vars.get('doc_type', '未知主题')}",
-        "constraints": [
-            f"受众：{doc_vars.get('audience', '未指定')}",
-            f"风格：{doc_vars.get('tone', '专业')}",
-            "只根据提供的信息撰写，不编造",
-            "需要图表的地方用占位标记",
-            "只求说清楚，不追求华丽",
-        ],
-        "materials": [
-            a.get("summary", "") 
-            for a in s.get("attachments", []) 
-            if a.get("summary")
-        ],
-        "output_format": "JSON: draft_md + placeholders",
-        "variables_snapshot": doc_vars,
-        "attachments_snapshot": s.get("attachments", []),
-    }
-    
-    # 构造消息
-    messages = [
-        {"role": "system", "content": WRITER_SYSTEM_PROMPT},
-        {"role": "user", "content": f"""请根据以下信息撰写文档：
-
-文档变量：
-```json
-{json.dumps(doc_vars, ensure_ascii=False, indent=2)}
-```
-
-{_format_materials(prompt_spec["materials"])}
-
-请开始撰写，输出 JSON 格式。"""}
-    ]
-    
-    try:
-        model = settings.model_writer
-        response = await model_client.call(model, messages, max_tokens=8192)
-        result = _parse_writer_response(response)
-        
-        node_run = {
-            "node_type": "writer",
-            "prompt_spec": prompt_spec,
-            "result": {
-                "draft_md_preview": result.get("draft_md", "")[:500] + "...",
-                "mermaid_count": len(result.get("mermaid_placeholders", [])),
-                "html_count": len(result.get("html_placeholders", [])),
-            },
-            "status": "success",
-            "timestamp": datetime.now().isoformat(),
-        }
-        
-        return {
-            **s,
-            "draft_md": result.get("draft_md", ""),
-            "mermaid_placeholders": result.get("mermaid_placeholders", []),
-            "html_placeholders": result.get("html_placeholders", []),
-            "node_runs": s.get("node_runs", []) + [node_run],
-            "current_node": "writer",
-            "node_status": "success",
-            "error": None,
-        }
-        
-    except Exception as e:
-        node_run = {
-            "node_type": "writer",
-            "prompt_spec": prompt_spec,
-            "result": None,
-            "status": "fail",
-            "error": {
-                "error_type": "model_error",
-                "error_message": str(e),
-                "retry_guidance": "重试调用撰写模型",
-            },
-            "timestamp": datetime.now().isoformat(),
-        }
-        
-        return {
-            **s,
-            "node_runs": s.get("node_runs", []) + [node_run],
-            "current_node": "writer",
-            "node_status": "fail",
-            "error": node_run["error"],
-            "retry_count": s.get("retry_count", 0) + 1,
-        }
-
-async def run_streaming(
-    state: Any,
-    on_content: Optional[Callable[[str], Any]] = None,
-    on_chapter_start: Optional[Callable[[int, str], Any]] = None,
-    cancel_event: Optional[Any] = None,
-) -> Dict[str, Any]:
-    """
-    B：文档撰写节点（流式版本）
-
-    - 流式输出 Markdown 草稿（实时推送给前端）
-    - 结束后自动解析占位标记生成 placeholders
-    """
-    s = _to_dict(state)
-    doc_vars = s.get("doc_variables", {})
-
-    # 放宽检查：只要有 doc_type/outline/plan_md 任一项，就可以开始撰写
-    if not doc_vars.get("doc_type") and not doc_vars.get("outline") and not doc_vars.get("plan_md"):
-        return {
-            **s,
-            "current_node": "writer",
-            "node_status": "fail",
-            "error": {
-                "error_type": "validation_failed",
-                "error_message": "文档信息不足，无法开始撰写（缺少 doc_type/outline/plan_md）",
-                "retry_guidance": "返回中控节点补充撰写指南/大纲",
-            },
-        }
-
-    prompt_spec = {
-        "node_type": "writer",
-        "goal": f"撰写草稿：{doc_vars.get('doc_type', '未命名主题')}",
-        "constraints": [
-            f"受众：{doc_vars.get('audience', '未指定')}",
-            f"风格：{doc_vars.get('tone', '专业')}",
-            "输出 Markdown 草稿（非 JSON）",
-            "需要图表/原型用占位标记",
-        ],
-        "materials": [
-            a.get("summary", "")
-            for a in s.get("attachments", [])
-            if a.get("summary")
-        ],
-        "output_format": "Markdown 草稿（含占位标记）",
-        "variables_snapshot": doc_vars,
-        "attachments_snapshot": s.get("attachments", []),
-    }
-
-    messages = [
-        {"role": "system", "content": WRITER_STREAMING_SYSTEM_PROMPT},
-        {"role": "user", "content": f"""请根据以下信息撰写文档草稿：
-
-文档变量：
-```json
-{json.dumps(doc_vars, ensure_ascii=False, indent=2)}
-```
-
-{_format_materials(prompt_spec["materials"])}
-
-参考计划（Plan）：
-{doc_vars.get("plan_md", "")}
-
-请直接输出 Markdown 草稿正文。"""},
-    ]
-
-    try:
-        model = settings.model_writer
-        draft = ""
-
-        # 章节粒度：只要 outline 存在且非空，就优先按章节执行（忽略 write_mode 标记，确保大纲被利用）
-        # 兼容旧逻辑：如果显式设置了 write_mode="full"，则跳过
-        has_outline = isinstance(doc_vars.get("outline"), list) and doc_vars.get("outline")
-        force_full = doc_vars.get("write_mode") == "full"
-        
-        use_chapter_mode = has_outline and not force_full
-        print(f"[Writer] mode={'chapter' if use_chapter_mode else 'full'}, outline_len={len(doc_vars.get('outline', []))}")
-
-        if use_chapter_mode:
-            outline: List[str] = [str(x) for x in doc_vars.get("outline") if str(x).strip()]
-            plan_md = str(doc_vars.get("plan_md") or "")
-
-            # 逐章生成
-            for idx, title in enumerate(outline):
-                if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
-                    raise asyncio.CancelledError()
-                if on_chapter_start:
-                    await _safe_callback(on_chapter_start, idx, title)
-
-                chapter_messages = [
-                    {"role": "system", "content": WRITER_STREAMING_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"""请根据以下信息，只撰写第 {idx+1} 章《{title}》的内容（Markdown）。
-
-要求：
-- 以二级标题开头：## {title}
-- 只写本章，不要写其他章节
-- 如需图表，使用 mermaid 代码块
-- 如需配图，可使用 {{IMG:提示词}} 占位符；不需要则不用
-
-Plan（供参考，可引用其中的约束/要点）：
-{plan_md}
-
-已写内容（供保持风格一致，可简要参考，不要重复输出）：
-{draft[-2000:]}
-"""},
-                ]
-
-                async for ev in model_client.stream_call(
-                    model=model,
-                    messages=chapter_messages,
-                    enable_thinking=settings.model_writer_enable_thinking,
-                    thinking_budget=settings.model_writer_thinking_budget,
-                    enable_search=settings.model_writer_enable_search,
-                    search_options={"search_strategy": settings.model_writer_search_strategy},
-                    max_tokens=8192,
-                ):
-                    if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
-                        raise asyncio.CancelledError()
-                    if ev["type"] == "thinking":
-                        # 丢弃思考内容（不展示）
-                        continue
-                    if ev["type"] == "content":
-                        chunk = ev["content"]
-                        draft += chunk
-                        if on_content:
-                            await _safe_callback(on_content, chunk)
-                    elif ev["type"] == "error":
-                        raise Exception(ev["message"])
-                    elif ev["type"] == "done":
-                        break
-
-                # 章节之间空一行
-                draft += "\n\n"
-                if on_content:
-                    await _safe_callback(on_content, "\n\n")
-        else:
-            async for ev in model_client.stream_call(
-                model=model,
-                messages=messages,
-                enable_thinking=settings.model_writer_enable_thinking,
-                thinking_budget=settings.model_writer_thinking_budget,
-                enable_search=settings.model_writer_enable_search,
-                search_options={"search_strategy": settings.model_writer_search_strategy},
-                max_tokens=8192,
-            ):
-                if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
-                    raise asyncio.CancelledError()
-                if ev["type"] == "thinking":
-                    continue
-                if ev["type"] == "content":
-                    chunk = ev["content"]
-                    draft += chunk
-                    if on_content:
-                        await _safe_callback(on_content, chunk)
-                elif ev["type"] == "error":
-                    raise Exception(ev["message"])
-                elif ev["type"] == "done":
-                    break
-
-        mermaid_placeholders, html_placeholders = _extract_placeholders(draft)
-
-        node_run = {
-            "node_type": "writer",
-            "prompt_spec": prompt_spec,
-            "result": {
-                "draft_md_preview": (draft[:500] + "...") if len(draft) > 500 else draft,
-                "mermaid_count": len(mermaid_placeholders),
-                "html_count": len(html_placeholders),
-            },
-            "status": "success",
-            "timestamp": datetime.now().isoformat(),
-        }
-
-        return {
-            **s,
-            "draft_md": draft,
-            "mermaid_placeholders": mermaid_placeholders,
-            "html_placeholders": html_placeholders,
-            "node_runs": s.get("node_runs", []) + [node_run],
-            "current_node": "writer",
-            "node_status": "success",
-            "error": None,
-        }
-
-    except asyncio.CancelledError:
-        node_run = {
-            "node_type": "writer",
-            "prompt_spec": prompt_spec,
-            "result": None,
-            "status": "fail",
-            "error": {
-                "error_type": "cancelled",
-                "error_message": "用户已停止输出",
-                "retry_guidance": "修改计划后可重新执行",
-            },
-            "timestamp": datetime.now().isoformat(),
-        }
-        return {
-            **s,
-            "node_runs": s.get("node_runs", []) + [node_run],
-            "current_node": "writer",
-            "node_status": "fail",
-            "error": node_run["error"],
-        }
-    except Exception as e:
-        node_run = {
-            "node_type": "writer",
-            "prompt_spec": prompt_spec,
-            "result": None,
-            "status": "fail",
-            "error": {
-                "error_type": "model_error",
-                "error_message": str(e),
-                "retry_guidance": "重试调用撰写模型",
-            },
-            "timestamp": datetime.now().isoformat(),
-        }
-        return {
-            **s,
-            "node_runs": s.get("node_runs", []) + [node_run],
-            "current_node": "writer",
-            "node_status": "fail",
-            "error": node_run["error"],
-            "retry_count": s.get("retry_count", 0) + 1,
-        }
-
-
 async def _safe_callback(callback: Callable, *args):
-    import asyncio
     res = callback(*args)
     if asyncio.iscoroutine(res):
         await res
 
+def _format_context(context_items: List[str]) -> str:
+    if not context_items:
+        return "无"
+    return "\n---\n".join(context_items)
 
-def _extract_placeholders(draft_md: str):
-    mermaids = []
-    htmls = []
+# --- Node Implementation ---
 
-    mermaid_descs = MERMAID_PATTERN.findall(draft_md or "")
-    html_descs = HTML_PATTERN.findall(draft_md or "")
+async def run(state: Any) -> Dict[str, Any]:
+    """
+    非流式入口（占位，主要使用 run_streaming）
+    """
+    return state
 
-    for idx, desc in enumerate(mermaid_descs, start=1):
-        mermaids.append({"id": f"mermaid_{idx}", "description": desc.strip()})
-    for idx, desc in enumerate(html_descs, start=1):
-        htmls.append({"id": f"html_{idx}", "description": desc.strip()})
-
-    return mermaids, htmls
-
-
-def _format_materials(materials: list) -> str:
-    """格式化参考材料"""
-    if not materials:
-        return ""
-    return "参考材料摘要：\n" + "\n---\n".join(materials)
-
-
-def _parse_writer_response(response: str) -> Dict[str, Any]:
-    """解析撰写模型输出"""
-    try:
-        if "```json" in response:
-            json_str = response.split("```json")[1].split("```")[0]
-        elif "```" in response:
-            json_str = response.split("```")[1].split("```")[0]
+async def run_streaming(
+    state: Any,
+    on_content: Optional[Callable[[str], Any]] = None,
+    on_skill_update: Optional[Callable[[Dict[str, Any]], Any]] = None, # 新的回调: 通知当前 Skill 状态
+    cancel_event: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    流式执行引擎
+    """
+    s = _to_dict(state)
+    skills_data = s.get("skills", [])
+    doc_vars = s.get("doc_variables", {})
+    
+    # 转换 skills dict 为 Skill 对象 (如果需要)
+    skills: List[Skill] = []
+    for item in skills_data:
+        if isinstance(item, dict):
+            # 兼容处理：确保有 id 和 status
+            if "id" not in item: item["id"] = f"s_{len(skills)}"
+            if "status" not in item: item["status"] = "pending"
+            try:
+                skills.append(Skill(**item))
+            except Exception:
+                 # 如果校验失败，构造一个基础 Skill
+                 skills.append(Skill(id=item.get("id"), type=item.get("type", "write_text"), desc=item.get("desc", ""), args=item.get("args", {})))
         else:
-            json_str = response
-        
-        return json.loads(json_str.strip())
-        
-    except (json.JSONDecodeError, IndexError):
-        # 降级：把整个输出当作 draft_md
+            skills.append(item)
+
+    if not skills:
         return {
-            "draft_md": response,
-            "mermaid_placeholders": [],
-            "html_placeholders": []
+            **s,
+            "current_node": "writer",
+            "node_status": "fail",
+            "error": {"error_type": "validation_failed", "error_message": "没有可执行的 Skills"},
+        }
+
+    draft_md = ""
+    context_items = [] # 累积的上下文 (Search Results, etc.)
+    # 初始上下文：Plan 和 Materials
+    if doc_vars.get("plan_md"):
+        context_items.append(f"【写作计划】\n{doc_vars['plan_md']}")
+    for m in s.get("attachments", []):
+         if m.get("summary"):
+             context_items.append(f"【参考材料】\n{m['summary']}")
+
+    try:
+        for i, skill in enumerate(skills):
+            # 检查取消
+            if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                raise asyncio.CancelledError()
+
+            # 1. 更新 UI 状态 (灯亮)
+            skill.status = "running"
+            if on_skill_update:
+                await _safe_callback(on_skill_update, skill.dict())
+
+            # 2. 执行 Skill
+            print(f"[Executor] Running skill: {skill.type} - {skill.desc}")
+            
+            skill_output = ""
+            
+            if skill.type == "search_web":
+                # 执行搜索 (模拟或真实调用)
+                query = skill.args.get("query", "")
+                purpose = skill.args.get("purpose", "")
+                
+                if on_content:
+                    await _safe_callback(on_content, f"\n\n> 🔍 **正在搜索**: {query}...\n\n")
+
+                # 这里应该调用真实的 search_tool，目前先模拟或使用 model_client 的搜索能力
+                # 由于 model_client.stream_call 支持 search，我们可以利用它
+                search_messages = [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": f"请搜索以下内容：{query}。目的是：{purpose}"}
+                ]
+                
+                search_result_text = ""
+                # 使用启用搜索的模型调用
+                async for ev in model_client.stream_call(
+                    model=settings.model_writer, # 使用 Writer 模型进行搜索总结
+                    messages=search_messages,
+                    enable_search=True,
+                    search_options={"search_strategy": "standard"},
+                    max_tokens=1000
+                ):
+                     if ev["type"] == "content":
+                         search_result_text += ev["content"]
+                
+                # 总结搜索结果存入 Context
+                summary_prompt = SEARCH_PROMPT_TEMPLATE.format(
+                    query=query, 
+                    search_results=search_result_text,
+                    purpose=purpose
+                )
+                context_items.append(f"【搜索结果-{query}】\n{search_result_text[:1000]}...") # 限制长度
+                skill.result = "搜索完成"
+                
+                if on_content:
+                    await _safe_callback(on_content, f"> ✅ **搜索完成**\n\n")
+
+
+            elif skill.type == "write_text":
+                instruction = skill.args.get("instruction", "")
+                
+                prompt = WRITER_TEXT_PROMPT_TEMPLATE.format(
+                    instruction=instruction,
+                    context=_format_context(context_items),
+                    draft_summary=draft_md[-1000:] if draft_md else "（暂无）"
+                )
+                
+                messages = [
+                    {"role": "system", "content": WRITER_BASE_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ]
+                
+                async for ev in model_client.stream_call(
+                    model=settings.model_writer,
+                    messages=messages,
+                    enable_thinking=settings.model_writer_enable_thinking,
+                    thinking_budget=settings.model_writer_thinking_budget,
+                    max_tokens=4096
+                ):
+                    if ev["type"] == "content":
+                        chunk = ev["content"]
+                        draft_md += chunk
+                        skill_output += chunk
+                        if on_content:
+                            await _safe_callback(on_content, chunk)
+                
+                draft_md += "\n\n"
+                if on_content: await _safe_callback(on_content, "\n\n")
+                skill.result = "撰写完成"
+
+
+            elif skill.type == "generate_image":
+                prompt = skill.args.get("prompt", "")
+                placement = skill.args.get("placement", "")
+                
+                if on_content:
+                    await _safe_callback(on_content, f"\n\n> 🎨 **正在生成图片**: {prompt}...\n\n")
+
+                # TODO: 调用真正的生图 API (如 flux-schnell / dall-e)
+                # 这里先生成 Markdown 占位符，由后续逻辑或前端处理
+                # 如果我们有 image_node，可以在这里直接调用 image node 的逻辑，或者只生成 {{IMG:...}}
+                
+                # 方案：直接生成 {{IMG:...}} 占位符，让现有的 export 服务处理，或者直接生成 mock URL
+                img_markdown = f"{{{{IMG:{prompt}}}}}"
+                draft_md += f"\n{img_markdown}\n"
+                
+                if on_content:
+                    await _safe_callback(on_content, f"![{prompt}](/storage/generated/placeholder_loading.png)\n") # 前端可以显示一个 loading 图
+                
+                skill.result = "生图指令已发送"
+
+
+            elif skill.type == "create_chart":
+                instruction = skill.args.get("instruction", "")
+                chart_type = skill.args.get("chart_type", "")
+                
+                if on_content:
+                    await _safe_callback(on_content, f"\n\n> 📊 **正在构建图表**: {chart_type}...\n\n")
+                
+                prompt = CHART_PROMPT_TEMPLATE.format(
+                    instruction=instruction,
+                    chart_type=chart_type,
+                    context=_format_context(context_items)
+                )
+                
+                messages = [{"role": "system", "content": WRITER_BASE_SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+                
+                chart_code = ""
+                async for ev in model_client.stream_call(model=settings.model_writer, messages=messages):
+                    if ev["type"] == "content":
+                        chart_code += ev["content"]
+                
+                # 清洗代码块标记
+                if "```mermaid" in chart_code:
+                    chart_code = chart_code.split("```mermaid")[1].split("```")[0].strip()
+                elif "```" in chart_code:
+                    chart_code = chart_code.split("```")[1].split("```")[0].strip()
+                
+                final_block = f"\n```mermaid\n{chart_code}\n```\n"
+                draft_md += final_block
+                if on_content:
+                    await _safe_callback(on_content, final_block)
+                
+                skill.result = "图表生成完成"
+
+
+            elif skill.type == "create_ui":
+                instruction = skill.args.get("instruction", "")
+                
+                if on_content:
+                     await _safe_callback(on_content, f"\n\n> 🖥️ **正在设计界面**...\n\n")
+
+                prompt = UI_PROMPT_TEMPLATE.format(instruction=instruction)
+                messages = [{"role": "system", "content": WRITER_BASE_SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+                
+                html_code = ""
+                async for ev in model_client.stream_call(model=settings.model_writer, messages=messages):
+                    if ev["type"] == "content":
+                        html_code += ev["content"]
+                
+                if "```html" in html_code:
+                    html_code = html_code.split("```html")[1].split("```")[0].strip()
+                
+                final_block = f"\n```html\n{html_code}\n```\n"
+                draft_md += final_block
+                if on_content:
+                    await _safe_callback(on_content, final_block)
+                
+                skill.result = "UI 生成完成"
+
+            # 3. 更新 Skill 状态 (完成)
+            skill.status = "completed"
+            if on_skill_update:
+                await _safe_callback(on_skill_update, skill.dict())
+        
+        # 循环结束
+        node_run = {
+            "node_type": "writer",
+            "status": "success",
+            "result": {"draft_len": len(draft_md)},
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        return {
+            **s,
+            "draft_md": draft_md,
+            "skills": [sk.dict() for sk in skills], # 更新状态后的 skills
+            "node_runs": s.get("node_runs", []) + [node_run],
+            "current_node": "writer",
+            "node_status": "success"
+        }
+
+    except asyncio.CancelledError:
+        # 处理取消
+        return {
+             **s,
+            "current_node": "writer",
+            "node_status": "fail",
+            "error": {"error_type": "cancelled", "error_message": "用户停止执行"}
+        }
+    except Exception as e:
+        print(f"[Writer] Error: {e}")
+        return {
+            **s,
+             "current_node": "writer",
+            "node_status": "fail",
+            "error": {"error_type": "model_error", "error_message": str(e)}
         }

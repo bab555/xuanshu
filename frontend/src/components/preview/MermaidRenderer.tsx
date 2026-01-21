@@ -65,17 +65,17 @@ export const MermaidRenderer: React.FC<MermaidRendererProps> = ({
   }
 
   if (error) {
+    // 仅在控制台打印错误，UI 上显示一个温和的占位符或保留源代码
+    console.warn('[Mermaid Render Error]', error);
     return (
-      <div className="mermaid-renderer mermaid-error">
-        <div className="error-icon">⚠️</div>
-        <div className="error-message">
-          <strong>图表渲染失败</strong>
-          <pre>{error}</pre>
+      <div className="mermaid-renderer mermaid-error-silent">
+        <div className="mermaid-source-preview">
+            {/* 渲染失败时，直接展示代码块，避免大红报错影响体验 */}
+            <pre>{code}</pre>
         </div>
-        <details className="error-code">
-          <summary>查看源代码</summary>
-          <pre>{code}</pre>
-        </details>
+        <div className="mermaid-error-hint" title={error}>
+            ⚠️ 图表渲染异常，等待自动修复
+        </div>
       </div>
     );
   }

@@ -7,7 +7,7 @@ import './MarkdownRenderer.css';
 
 interface MarkdownRendererProps {
   content: string;
-  onCodeBlockError?: (type: string, error: string) => void;
+  onCodeBlockError?: (type: string, error: string, code: string) => void;
 }
 
 export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
@@ -26,7 +26,7 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
         return (
           <MermaidRenderer 
             code={codeContent}
-            onError={(err) => onCodeBlockError?.('mermaid', err)}
+            onError={(err) => onCodeBlockError?.('mermaid', err, codeContent)}
           />
         );
       }
@@ -36,7 +36,7 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
         return (
           <HtmlSandbox 
             code={codeContent}
-            onError={(err) => onCodeBlockError?.('html', err)}
+            onError={(err) => onCodeBlockError?.('html', err, codeContent)}
           />
         );
       }

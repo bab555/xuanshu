@@ -91,63 +91,6 @@ async def execute_workflow_streaming(
             
             cancel_event = run_cancel_events.get(run_id)
 
-            # 定义流式回调（对话/计划分流：左侧只显示对话，中间只显示 Plan）
-            class _PlanStreamSplitter:
-                def __init__(self):
-                    self.mode = "chat"  # chat | plan
-                    self.buf = ""
-                    self.plan_marker = "【计划】"
-                    self.chat_marker = "【对话】"
-
-                async def push(self, chunk: str):
-                    if not chunk:
-                        return
-                    self.buf += chunk
-                    # 逐步处理 marker 切换
-                    while True:
-                        if self.mode == "chat":
-                            idx = self.buf.find(self.plan_marker)
-                            if idx >= 0:
-                                pre = self.buf[:idx]
-                                post = self.buf[idx + len(self.plan_marker):]
-                                pre = pre.replace(self.chat_marker, "")
-                                if pre:
-                                    await broadcast_to_run(run_id, "stream_content", {"content": pre})
-                                self.mode = "plan"
-                                self.buf = post
-                                continue
-                            # 没看到 marker：为了兼容分片 marker，保留尾部
-                            keep = max(len(self.plan_marker) - 1, len(self.chat_marker) - 1, 8)
-                            if len(self.buf) > keep:
-                                out = self.buf[:-keep]
-                                self.buf = self.buf[-keep:]
-                                out = out.replace(self.chat_marker, "")
-                                if out:
-                                    await broadcast_to_run(run_id, "stream_content", {"content": out})
-                            break
-                        else:
-                            # plan 模式：全部当 plan（同样保留尾部避免丢字符）
-                            keep = max(len(self.plan_marker) - 1, 8)
-                            if len(self.buf) > keep:
-                                out = self.buf[:-keep]
-                                self.buf = self.buf[-keep:]
-                                if out:
-                                    await broadcast_to_run(run_id, "stream_plan", {"content": out})
-                            break
-
-                async def flush(self):
-                    if not self.buf:
-                        return
-                    out = self.buf
-                    self.buf = ""
-                    if self.mode == "plan":
-                        await broadcast_to_run(run_id, "stream_plan", {"content": out})
-                    else:
-                        out = out.replace(self.chat_marker, "")
-                        await broadcast_to_run(run_id, "stream_content", {"content": out})
-
-            splitter = _PlanStreamSplitter()
-
             # 定义流式回调
             async def on_thinking(content: str):
                 if cancel_event and cancel_event.is_set():
@@ -158,7 +101,8 @@ async def execute_workflow_streaming(
             async def on_content(content: str):
                 if cancel_event and cancel_event.is_set():
                     raise asyncio.CancelledError()
-                await splitter.push(content)
+                # 直接转发对话内容到左侧
+                await broadcast_to_run(run_id, "stream_content", {"content": content})
             
             # 广播开始思考
             await broadcast_to_run(run_id, "node_update", {
@@ -166,18 +110,62 @@ async def execute_workflow_streaming(
                 "status": "thinking",
             })
             
+            # 维护一个 buffer 用于流式提取 Plan
+            current_tool_args_buffer = ""
+            last_broadcast_plan_len = 0
+
             # 使用流式 controller（A）
-            state = await controller.run_streaming(
-                initial_state,
-                on_thinking=on_thinking,
-                on_content=on_content,
-            )
+            async for event in controller.run_streaming_generator(initial_state):
+                # 处理不同类型的事件
+                if event["type"] == "thinking":
+                    await on_thinking(event["content"])
+                
+                elif event["type"] == "content":
+                    await on_content(event["content"])
+                
+                elif event["type"] == "tool_call":
+                    # 实时尝试从 arguments 中提取 content_md
+                    tool_calls = event.get("tool_calls", [])
+                    if tool_calls:
+                        tc = tool_calls[0]
+                        if tc.get("function", {}).get("name") == "update_plan":
+                            args_chunk = tc.get("function", {}).get("arguments", "")
+                            # 注意：DashScope SDK 返回的 arguments 通常是累积的完整字符串
+                            # 如果是增量的，我们需要自己累积；如果是完整的，直接用
+                            # 假设 SDK 返回的是增量值（根据 model_client.py 的实现及 incremental_output=True）
+                            current_tool_args_buffer += args_chunk
+                            
+                            # 尝试提取 content_md
+                            import re
+                            # 匹配 "content_md": "..."，尝试非贪婪匹配直到下一个字段 "outline" 或字符串结尾
+                            # 注意：Markdown 内容中可能包含转义引号，简单的正则很难完美解析
+                            # 这里假设 content_md 在 outline 之前
+                            match = re.search(r'"content_md"\s*:\s*"(.*?)(?:",\s*"outline"|$)', current_tool_args_buffer, re.DOTALL)
+                            if match:
+                                current_content = match.group(1)
+                                # 去掉末尾可能的未闭合引号（如果正则匹配到了结尾）
+                                if current_content.endswith('"') and not current_content.endswith('\\"'):
+                                     current_content = current_content[:-1]
+                                
+                                # 简单处理转义（\n, \", \\）
+                                # 真正的流式 JSON 解析很复杂，这里做个近似处理
+                                try:
+                                    # 替换常见转义
+                                    decoded_content = current_content.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+                                except:
+                                    decoded_content = current_content
+                                
+                                # 广播增量
+                                if len(decoded_content) > last_broadcast_plan_len:
+                                    delta = decoded_content[last_broadcast_plan_len:]
+                                    await broadcast_to_run(run_id, "stream_plan", {"content": delta})
+                                    last_broadcast_plan_len = len(decoded_content)
 
-            # flush leftover buffer to UI
-            await splitter.flush()
+                elif event["type"] == "done":
+                    # 最终状态更新
+                    state = event["state"]
+                    # ... 后续持久化逻辑 ...
 
-            # controller 流式结束
-            await broadcast_to_run(run_id, "stream_done", {})
             
             async def _persist_latest_node_run(s: Dict[str, Any], fallback_node: str):
                 if s.get("node_runs"):
@@ -245,11 +233,11 @@ async def execute_workflow_execute_streaming(
     db_url: str,
 ):
     """
-    Execute 阶段：执行 writer（B，流式输出草稿）→ image（D，按 {{image+...}} 生图记录）→ mermaid（中控模型校对 Mermaid，仅有问题才修复）。
+    Execute 阶段：Planner -> Writer (Streaming with Skills) -> Image (if needed) -> MermaidGuard
     """
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
     from sqlalchemy.orm import sessionmaker
-    from app.nodes import writer, image
+    from app.nodes import writer, image, planner
     from app.nodes import mermaid_guard
 
     engine = create_async_engine(db_url)
@@ -278,8 +266,23 @@ async def execute_workflow_execute_streaming(
                     )
                     db.add(nr)
                     await db.commit()
+            
+            # --- 1. Planner Phase ---
+            await broadcast_to_run(run_id, "node_update", {"node": "planner", "status": "running"})
+            if cancel_event and cancel_event.is_set(): raise asyncio.CancelledError()
 
-            # B：writer（流式）
+            # Planner 会根据 initial_state 中的 plan_md/outline 生成 skills
+            state = await planner.run(initial_state)
+            await _persist_latest_node_run(state, "planner")
+            
+            # 持久化 Skills 并广播
+            skills = state.get("skills", [])
+            run.doc_variables = {**(run.doc_variables or {}), "skills": skills}
+            await db.commit()
+            await broadcast_to_run(run_id, "stream_skills", {"skills": skills})
+
+
+            # --- 2. Writer Phase (Skills Execution) ---
             await broadcast_to_run(run_id, "node_update", {"node": "writer", "status": "running"})
 
             async def on_writer(content: str):
@@ -287,25 +290,16 @@ async def execute_workflow_execute_streaming(
                     raise asyncio.CancelledError()
                 await broadcast_to_run(run_id, "stream_writer", {"content": content})
 
-            async def on_chapter(idx: int, title: str):
+            async def on_skill(skill_data: Dict[str, Any]):
                 if cancel_event and cancel_event.is_set():
                     raise asyncio.CancelledError()
-                await broadcast_to_run(run_id, "chapter_update", {"index": idx, "title": title})
-                # 章节粒度更新（用于刷新进入文档后的恢复）
-                try:
-                    run.doc_variables = {**(run.doc_variables or {}), "current_step_index": idx}
-                    await db.commit()
-                except Exception:
-                    pass
+                await broadcast_to_run(run_id, "skill_update", {"skill": skill_data})
 
-            # 兼容：如果旧数据没带 write_mode，但有 outline，则默认章节粒度
-            if isinstance(initial_state.get("doc_variables"), dict) and initial_state["doc_variables"].get("write_mode") is None:
-                initial_state["doc_variables"]["write_mode"] = "chapter"
-
+            # 使用 Planner 更新后的 state (包含 skills)
             state = await writer.run_streaming(
-                initial_state,
+                state,
                 on_content=on_writer,
-                on_chapter_start=on_chapter,
+                on_skill_update=on_skill,
                 cancel_event=cancel_event,
             )
             await _persist_latest_node_run(state, "writer")
@@ -320,7 +314,10 @@ async def execute_workflow_execute_streaming(
             if cancel_event and cancel_event.is_set():
                 raise asyncio.CancelledError()
 
-            # D：image（视需要：仅当正文包含 {{image+...}} 才执行）
+
+            # --- 3. Image Generation (Optional Post-Processing) ---
+            # Writer 可能会生成 {{IMG:...}} 占位符（通过 generate_image skill）
+            # 我们仍然保留这个环节来处理占位符 -> 实际图片
             draft_for_img = state.get("draft_md") or ""
             if "{{image+" in (draft_for_img or "").lower():
                 await broadcast_to_run(run_id, "node_update", {"node": "image", "status": "running"})
@@ -332,17 +329,22 @@ async def execute_workflow_execute_streaming(
             if cancel_event and cancel_event.is_set():
                 raise asyncio.CancelledError()
 
-            # Mermaid/HTML 校对（无感后台守护：不广播、不写 node_run、不改 current_node；仅在需要时修复代码块）
+
+            # --- 4. Mermaid/HTML Guard ---
+            # Mermaid/HTML 校对（无感后台守护）
             try:
                 state = await mermaid_guard.run(state)
             except Exception:
-                # 守护失败不影响主流程完成（避免用户感知/卡住）
                 pass
 
+
+            # --- Finalize ---
             final_md = state.get("draft_md") or ""
             run.final_md = final_md
-
+            
             final_vars = state.get("doc_variables") or {}
+            if state.get("skills"):
+                final_vars["skills"] = state["skills"]
             if state.get("chat_history") is not None:
                 final_vars = {**final_vars, "chat_history": state.get("chat_history")}
             run.doc_variables = final_vars
@@ -357,7 +359,7 @@ async def execute_workflow_execute_streaming(
             doc_obj = await db.get(Document, run.document_id)
             if doc_obj:
                 doc_obj.status = "completed"
-                # 标题自动同步：未命名文档时，用大纲首章/文档类型作为标题
+                # 标题自动同步
                 if (doc_obj.title or "").startswith("未命名"):
                     outline = (final_vars or {}).get("outline")
                     if isinstance(outline, list) and outline and str(outline[0]).strip():
@@ -821,6 +823,7 @@ async def workflow_stream(
     - stream_thinking: {"content": "..."} 中控思考过程增量
     - stream_content: {"content": "..."} 中控对话回复增量（左侧）
     - stream_plan: {"content": "..."} Plan（Markdown）增量（中间）
+    - stream_tool_call: {"tool_calls": [...]} 工具调用通知
     - stream_done: {} 中控流式结束
     - stream_writer: {"content": "..."} 撰写草稿增量
     """

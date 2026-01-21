@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     model_image: str = "qwen-image-max"                # D：生图
     model_assembler: str = "qwen3-max"                 # E：全文整合
     model_attachment_long: str = "qwen-long"           # F：附件分析（待定）
+    model_repair: str = "deepseek-v3"                  # G：代码修复（Mermaid/HTML）
     
     # ===== 数据库 =====
     database_url: str = "sqlite+aiosqlite:///./data/doctools.db"

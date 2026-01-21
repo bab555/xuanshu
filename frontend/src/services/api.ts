@@ -68,6 +68,8 @@ export const apiService = {
       api.post<{ share_id: string }>(`/docs/${id}/share`, { to_username: toUsername, note }),
     delete: (id: string) => api.delete<{ ok: boolean }>(`/docs/${id}`),
     deleteCc: (id: string) => api.delete<{ ok: boolean }>(`/docs/${id}/cc`),
+    repair: (id: string, errors: Array<{ type: string; error: string; code: string }>) =>
+      api.post(`/docs/${id}/repair`, { errors }),
   },
 
   // 用户（抄送下拉）

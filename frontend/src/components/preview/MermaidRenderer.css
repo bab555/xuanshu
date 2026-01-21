@@ -28,53 +28,34 @@
   to { transform: rotate(360deg); }
 }
 
-.mermaid-error {
-  background: var(--color-error-bg, #fef2f2);
-  border: 1px solid var(--color-error, #dc2626);
-  display: flex;
-  flex-direction: column;
-  gap: var(--spacing-sm);
+.mermaid-renderer.mermaid-error-silent {
+  border: 1px dashed #e2e8f0;
+  border-radius: 8px;
+  padding: 12px;
+  background: #f8fafc;
+  position: relative;
 }
 
-.mermaid-error .error-icon {
-  font-size: 24px;
-}
-
-.mermaid-error .error-message {
-  display: flex;
-  flex-direction: column;
-  gap: var(--spacing-xs);
-}
-
-.mermaid-error .error-message strong {
-  color: var(--color-error, #dc2626);
-}
-
-.mermaid-error .error-message pre {
+.mermaid-renderer.mermaid-error-silent .mermaid-source-preview pre {
   margin: 0;
+  font-family: monospace;
   font-size: 12px;
-  color: var(--color-text-muted);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.mermaid-error .error-code {
-  margin-top: var(--spacing-sm);
-  font-size: 12px;
-}
-
-.mermaid-error .error-code summary {
-  cursor: pointer;
-  color: var(--color-text-muted);
-}
-
-.mermaid-error .error-code pre {
-  margin-top: var(--spacing-xs);
-  padding: var(--spacing-sm);
-  background: var(--color-bg-tertiary);
-  border-radius: var(--radius-sm);
+  color: #64748b;
   overflow-x: auto;
-  font-size: 11px;
+  white-space: pre-wrap;
+}
+
+.mermaid-renderer.mermaid-error-silent .mermaid-error-hint {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  font-size: 10px;
+  color: #f59e0b;
+  background: #fffbeb;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid #fcd34d;
+  cursor: help;
 }
 
 .mermaid-success {

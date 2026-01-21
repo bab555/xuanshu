@@ -109,6 +109,16 @@ class DocVariables(BaseModel):
         extra = "allow"  # 允许额外字段
 
 
+class Skill(BaseModel):
+    """Atomic Skill（原子能力单元）"""
+    id: str
+    type: Literal["write_text", "search_web", "generate_image", "create_chart", "create_ui"]
+    desc: str  # 简短描述（用于 UI 小灯文字）
+    args: Dict[str, Any]  # 参数：instruction, query, purpose, etc.
+    status: Literal["pending", "running", "completed", "failed"] = "pending"
+    result: Optional[str] = None  # 执行结果摘要/URL
+
+
 class WorkflowState(BaseModel):
     """LangGraph 工作流状态"""
     doc_id: str
@@ -117,6 +127,7 @@ class WorkflowState(BaseModel):
     
     # 核心数据
     doc_variables: Dict[str, Any] = {}
+    skills: List[Skill] = []  # 规划出的 Skills 序列
     attachments: List[Attachment] = []
     chat_history: List[dict] = []
     

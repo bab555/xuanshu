@@ -5,7 +5,7 @@ import { ThreeColumnLayout } from '@/components/layout/ThreeColumnLayout';
 import { ChatPanel } from '@/components/chat/ChatPanel';
 import { FlowPanel } from '@/components/flow/FlowPanel';
 import { PreviewPanel } from '@/components/preview/PreviewPanel';
-import type { DocumentDetail, NodeRun, WSEvent, ChatMessage } from '@/types';
+import type { DocumentDetail, NodeRun, WSEvent, ChatMessage, Skill } from '@/types';
 import './DocEditor.css';
 
 export function DocEditor() {
@@ -14,6 +14,7 @@ export function DocEditor() {
   const [doc, setDoc] = useState<DocumentDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [nodeRuns, setNodeRuns] = useState<NodeRun[]>([]);
+  const [skills, setSkills] = useState<Skill[]>([]); // New state for skills
   const [activeStepIndex, setActiveStepIndex] = useState(-1);
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -23,6 +24,7 @@ export function DocEditor() {
   // 流式输出状态
   const [streamingThinking, setStreamingThinking] = useState('');
   const [streamingContent, setStreamingContent] = useState('');
+  const [streamingToolCalls, setStreamingToolCalls] = useState<{ name: string; args: any }[]>([]); // New state
   const [planText, setPlanText] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingDraft, setStreamingDraft] = useState('');
@@ -36,6 +38,39 @@ export function DocEditor() {
   const [shareUsersLoading, setShareUsersLoading] = useState(false);
   const [shareNote, setShareNote] = useState('');
   const [shareSubmitting, setShareSubmitting] = useState(false);
+  
+  // 收集 Mermaid 渲染错误
+  const mermaidErrorsRef = useRef<Array<{ type: string; error: string; code: string }>>([]);
+
+  const handleCodeBlockError = useCallback((type: string, error: string, code: string) => {
+    // 简单去重：如果 code 和 error 都相同，则不重复添加
+    const exists = mermaidErrorsRef.current.some(e => e.code === code && e.error === error);
+    if (!exists) {
+      console.log('[DocEditor] Collected Error:', { type, error, code });
+      mermaidErrorsRef.current.push({ type, error, code });
+    }
+  }, []);
+
+  const triggerAutoRepair = async () => {
+    if (mermaidErrorsRef.current.length === 0) return;
+    if (!docId) return;
+
+    console.log('[DocEditor] Triggering Auto Repair...', mermaidErrorsRef.current);
+    const errorsToFix = [...mermaidErrorsRef.current];
+    mermaidErrorsRef.current = []; // 清空，避免重复触发
+
+    try {
+      setIsProcessing(true); // 显示处理中
+      await apiService.docs.repair(docId, errorsToFix);
+      // 修复完成后，刷新文档
+      await loadDoc();
+      console.log('[DocEditor] Auto Repair Completed');
+    } catch (err) {
+      console.error('[DocEditor] Auto Repair Failed', err);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
 
   const applyChatHistoryFromDocVars = (docVars: any) => {
     const history = docVars?.chat_history;
@@ -68,6 +103,10 @@ export function DocEditor() {
       if (vars?.plan_md) {
         setPlanText(String(vars.plan_md));
       }
+      // 恢复 Skills
+      if (Array.isArray(vars?.skills)) {
+        setSkills(vars.skills as Skill[]);
+      }
       // 恢复最近一次运行节点（用于底部小灯/状态）
       if (res.data?.latest_run?.node_runs) {
         setNodeRuns(res.data.latest_run.node_runs);
@@ -95,6 +134,7 @@ export function DocEditor() {
     // 重置流式状态
     setStreamingThinking('');
     setStreamingContent('');
+    setStreamingToolCalls([]);
     setIsStreaming(false);
     setStreamingDraft('');
     setStreamingFinal('');
@@ -163,6 +203,10 @@ export function DocEditor() {
         if (msg.data.doc_variables?.plan_md) {
           setPlanText(String(msg.data.doc_variables.plan_md));
         }
+        // 恢复 Skills
+        if (Array.isArray(msg.data.doc_variables?.skills)) {
+          setSkills(msg.data.doc_variables.skills);
+        }
         break;
 
       case 'node_update':
@@ -208,8 +252,33 @@ export function DocEditor() {
         setPlanText((prev) => prev + msg.data.content);
         break;
 
+      case 'stream_tool_call':
+        // 工具调用通知
+        if (msg.data.tool_calls) {
+          setStreamingToolCalls((prev) => {
+            // 合并工具调用（简单追加，去重可根据 id）
+            const newCalls = msg.data.tool_calls.map((tc: any) => ({
+              name: tc.function.name,
+              args: tc.function.arguments,
+            }));
+            return [...prev, ...newCalls];
+          });
+        }
+        break;
+
       case 'stream_done':
         setIsStreaming(false);
+        break;
+
+      case 'stream_skills':
+        setSkills(msg.data.skills || []);
+        break;
+
+      case 'skill_update':
+        setSkills((prev) => {
+          const updatedSkill = msg.data.skill;
+          return prev.map((s) => (s.id === updatedSkill.id ? updatedSkill : s));
+        });
         break;
 
       case 'stream_writer':
@@ -251,6 +320,7 @@ export function DocEditor() {
         setIsExecuting(false);
         setStreamingThinking('');
         setStreamingContent('');
+        setStreamingToolCalls([]);
         // 注意：Plan 文本不清空，便于用户确认后点击“开始执行”
         setStreamingDraft('');
         setStreamingFinal('');
@@ -261,7 +331,13 @@ export function DocEditor() {
           setPlanText(String(msg.data.doc_variables.plan_md));
         }
         // 刷新文档
-        loadDoc();
+        loadDoc().then(() => {
+            // 检查是否有 Mermaid 错误需要修复
+            // 稍微延迟一下，确保渲染完成并收集到错误
+            setTimeout(() => {
+                triggerAutoRepair();
+            }, 1000);
+        });
         break;
 
       case 'run_error':
@@ -318,6 +394,7 @@ export function DocEditor() {
     setStreamingThinking('');
     setPlanText('');
     setStreamingDraft('');
+    setStreamingToolCalls([]);
     setIsExecuting(false);
 
     try {
@@ -463,6 +540,7 @@ export function DocEditor() {
             isProcessing={isProcessing}
             streamingThinking={streamingThinking}
             streamingContent={streamingContent}
+            streamingToolCalls={streamingToolCalls}
             isStreaming={isStreaming}
           />
         }
@@ -472,12 +550,19 @@ export function DocEditor() {
             planText={planText}
             steps={steps}
             activeStepIndex={activeStepIndex}
+            skills={skills} // Pass skills
             isExecuting={isExecuting || isProcessing}
             onExecute={handleExecute}
             onStop={handleStop}
           />
         }
-        right={<PreviewPanel docId={docId!} content={contentMd} />}
+        right={
+            <PreviewPanel 
+                docId={docId!} 
+                content={contentMd} 
+                onCodeBlockError={handleCodeBlockError}
+            />
+        }
       />
     </div>
   );

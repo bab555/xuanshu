@@ -12,6 +12,7 @@ interface Props {
   // 流式输出
   streamingThinking?: string;
   streamingContent?: string;
+  streamingToolCalls?: { name: string; args: any }[]; // New prop
   isStreaming?: boolean;
 }
 
@@ -23,6 +24,7 @@ export function ChatPanel({
   isProcessing = false,
   streamingThinking = '',
   streamingContent = '',
+  streamingToolCalls = [], // New prop
   isStreaming = false,
 }: Props) {
   const [input, setInput] = useState('');
@@ -241,6 +243,20 @@ export function ChatPanel({
                           <span className="cursor-blink thinking-cursor">▌</span>
                         </div>
                       )}
+                    </div>
+                  )}
+
+                  {/* 工具调用显示 */}
+                  {streamingToolCalls && streamingToolCalls.length > 0 && (
+                    <div className="tool-calls-section">
+                      {streamingToolCalls.map((tool, idx) => (
+                        <div key={idx} className="tool-call-item">
+                          <span className="tool-icon">🔧</span>
+                          <span className="tool-name">正在执行: {tool.name}</span>
+                          {/* <span className="tool-args">{JSON.stringify(tool.args)}</span> */}
+                          <span className="tool-spinner" />
+                        </div>
+                      ))}
                     </div>
                   )}
 

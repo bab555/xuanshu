@@ -42,6 +42,25 @@ export interface Attachment {
   summary?: string;
 }
 
+// Skill
+export interface Skill {
+  id: string;
+  type: 'write_text' | 'search_web' | 'generate_image' | 'create_chart' | 'create_ui';
+  desc: string;
+  args: Record<string, any>;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  result?: string;
+}
+
+// Tool Call (New)
+export interface ToolCall {
+  id: string;
+  name: string;
+  args: Record<string, any>;
+  status: 'calling' | 'success' | 'failed';
+  result?: string;
+}
+
 // 工作流
 export interface WorkflowRun {
   run_id: string;
@@ -81,22 +100,26 @@ export interface NodeRun {
 // 节点类型
 export type NodeType =
   | 'controller'
+  | 'planner'
   | 'writer'
   | 'diagram'
   | 'image'
   | 'checker'
   | 'assembler'
   | 'attachment'
+  | 'mermaid_guard'
   | 'export';
 
 export const NODE_LABELS: Record<NodeType, string> = {
   controller: 'A：中控对话',
+  planner: 'P：执行规划',
   writer: 'B：文档撰写',
   diagram: 'C：图文助手',
   image: 'D：生图助手',
   checker: 'E：终审校验',
   assembler: 'E：全文整合',
   attachment: 'F：附件分析',
+  mermaid_guard: 'G：格式校对',
   export: 'X：导出',
 };
 
@@ -105,6 +128,7 @@ export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   attachments?: string[];
+  tool_calls?: ToolCall[]; // 支持显示工具调用
 }
 
 // WebSocket 事件
@@ -119,11 +143,14 @@ export interface WSEvent {
     | 'stream_thinking'  // 思考过程增量
     | 'stream_content'   // 回复内容增量
     | 'stream_plan'      // Plan（Markdown）增量
+    | 'stream_tool_call' // 工具调用通知 (New)
     | 'stream_done'      // 流式输出完成
+    | 'stream_skills'    // Skills 列表生成
+    | 'skill_update'     // Skill 状态更新
     | 'stream_writer'    // 撰写草稿增量
     | 'stream_final_reset' // 终审流式开始前清空
     | 'stream_final'     // 终审最终正文增量
-    | 'chapter_update'   // 章节/skills 小灯进度
+    | 'chapter_update'   // (Deprecated) 章节/skills 小灯进度
     | 'run_cancelled'    // 用户停止输出
     | 'ack_stop';        // 服务端确认停止
   data: any;

@@ -7,6 +7,7 @@ DashScope 模型客户端封装
 - 流式输出
 - 带文件的对话（LONG 模型）
 - 图片生成（qwen-image-max）
+- 工具调用（Function Calling）
 """
 import os
 import dashscope
@@ -57,6 +58,7 @@ class DashScopeClient:
         thinking_budget: Optional[int] = None,
         enable_search: bool = False,
         search_options: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
         **kwargs
     ) -> str:
         """
@@ -68,6 +70,7 @@ class DashScopeClient:
             max_tokens: 最大输出 token 数
             temperature: 温度参数
             enable_thinking: 是否开启深度思考模式
+            tools: 工具定义列表
 
         Returns:
             模型输出文本
@@ -95,6 +98,10 @@ class DashScopeClient:
             call_kwargs["enable_search"] = True
             if search_options is not None:
                 call_kwargs["search_options"] = search_options
+
+        # 工具调用
+        if tools:
+            call_kwargs["tools"] = tools
 
         # 合并额外参数
         call_kwargs.update(kwargs)
@@ -172,6 +179,7 @@ class DashScopeClient:
         thinking_budget: Optional[int] = None,
         enable_search: bool = False,
         search_options: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
         **kwargs
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
@@ -183,11 +191,13 @@ class DashScopeClient:
             max_tokens: 最大输出 token 数
             temperature: 温度参数
             enable_thinking: 是否开启深度思考模式
+            tools: 工具列表
 
         Yields:
             流式事件字典:
             - {"type": "thinking", "content": "..."} - 思考内容（增量）
             - {"type": "content", "content": "..."} - 回复内容（增量）
+            - {"type": "tool_call", "tool_calls": [...]} - 工具调用信息
             - {"type": "done", "reasoning": "...", "content": "..."} - 完成，包含完整内容
         """
         api_key = self._ensure_api_key()
@@ -212,6 +222,9 @@ class DashScopeClient:
             call_kwargs["enable_search"] = True
             if search_options is not None:
                 call_kwargs["search_options"] = search_options
+        
+        if tools:
+            call_kwargs["tools"] = tools
 
         call_kwargs.update(kwargs)
 
@@ -223,9 +236,11 @@ class DashScopeClient:
         q: queue.Queue = queue.Queue()
         full_reasoning = ""
         full_content = ""
+        # 用于累积工具调用 {index: tool_call_dict}
+        full_tool_calls_map = {}
 
         def sync_stream():
-            nonlocal full_reasoning, full_content
+            nonlocal full_reasoning, full_content, full_tool_calls_map
             try:
                 responses = Generation.call(**call_kwargs)
                 for response in responses:
@@ -238,6 +253,63 @@ class DashScopeClient:
                             if reasoning_delta:
                                 full_reasoning += reasoning_delta
                                 q.put({"type": "thinking", "content": reasoning_delta})
+                            
+                            # 工具调用 (tool_calls)
+                            # DashScope 流式返回 tool_calls 是增量的
+                            t_calls = self._safe_get_message_field(message, "tool_calls", None)
+                            if t_calls:
+                                # 累积工具调用
+                                for tc in t_calls:
+                                    # 兼容对象访问和字典访问
+                                    idx = 0
+                                    if isinstance(tc, dict):
+                                        idx = tc.get("index", 0)
+                                    else:
+                                        idx = getattr(tc, "index", 0)
+                                    
+                                    if idx not in full_tool_calls_map:
+                                        full_tool_calls_map[idx] = {
+                                            "index": idx,
+                                            "id": "",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "",
+                                                "arguments": ""
+                                            }
+                                        }
+                                    
+                                    # 更新 id/type (通常在第一帧)
+                                    if isinstance(tc, dict):
+                                        tc_id = tc.get("id", "")
+                                        tc_type = tc.get("type", "")
+                                        func = tc.get("function", {})
+                                    else:
+                                        tc_id = getattr(tc, "id", "")
+                                        tc_type = getattr(tc, "type", "")
+                                        func = getattr(tc, "function", None)
+
+                                    if tc_id:
+                                        full_tool_calls_map[idx]["id"] = tc_id
+                                    if tc_type:
+                                        full_tool_calls_map[idx]["type"] = tc_type
+                                    
+                                    # 更新 function
+                                    if func:
+                                        if isinstance(func, dict):
+                                            name = func.get("name", "")
+                                            args = func.get("arguments", "")
+                                        else:
+                                            name = getattr(func, "name", "")
+                                            args = getattr(func, "arguments", "")
+                                            
+                                        if name:
+                                            full_tool_calls_map[idx]["function"]["name"] = name
+                                        if args:
+                                            full_tool_calls_map[idx]["function"]["arguments"] += args
+
+                                # 将增量 tool_calls 传递出去（保持增量结构，供 workflow.py 累积）
+                                q.put({"type": "tool_call", "tool_calls": t_calls})
+
                             # 回复内容
                             content_delta = self._safe_get_message_field(message, "content", "")
                             if content_delta:
@@ -246,8 +318,17 @@ class DashScopeClient:
                     else:
                         q.put({"type": "error", "message": f"API 错误: {response.code} - {response.message}"})
                         break
+                
+                # 构造最终完整的 tool_calls 列表
+                final_tool_calls = [full_tool_calls_map[k] for k in sorted(full_tool_calls_map.keys())]
+                
                 # 完成
-                q.put({"type": "done", "reasoning": full_reasoning, "content": full_content})
+                q.put({
+                    "type": "done", 
+                    "reasoning": full_reasoning, 
+                    "content": full_content,
+                    "tool_calls": final_tool_calls
+                })
             except Exception as e:
                 q.put({"type": "error", "message": str(e)})
             finally:

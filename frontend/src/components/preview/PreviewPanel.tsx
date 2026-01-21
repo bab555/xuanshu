@@ -6,9 +6,10 @@ import './PreviewPanel.css'
 interface Props {
   docId: string
   content: string
+  onCodeBlockError?: (type: string, error: string, code: string) => void
 }
 
-export function PreviewPanel({ docId, content }: Props) {
+export function PreviewPanel({ docId, content, onCodeBlockError }: Props) {
   const [activeTab, setActiveTab] = useState<'preview' | 'source'>('preview')
 
   const downloadMd = () => {
@@ -63,7 +64,10 @@ export function PreviewPanel({ docId, content }: Props) {
           </div>
         ) : activeTab === 'preview' ? (
           <div className="preview-markdown">
-            <MarkdownRenderer content={content} />
+            <MarkdownRenderer 
+              content={content} 
+              onCodeBlockError={onCodeBlockError}
+            />
           </div>
         ) : (
           <pre className="preview-source">{content}</pre>

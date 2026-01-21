@@ -307,24 +307,62 @@ async def delete_my_document(
     return {"ok": True}
 
 
-@router.delete("/{doc_id}/cc", response_model=dict)
-async def delete_cc_document(
+from app.nodes.repair import run_repair
+
+# ... (existing imports)
+
+class RepairRequest(BaseModel):
+    errors: List[Dict[str, Any]] # [{"code": "...", "error": "...", "type": "mermaid"}]
+
+@router.post("/{doc_id}/repair", response_model=DocumentDetail)
+async def repair_document(
     doc_id: str,
+    req: RepairRequest,
     user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db)
 ):
-    """删除抄送给我的文档（软删除：仅对接收者隐藏，不影响抄送方）"""
+    """
+    修复文档中的代码块错误 (Mermaid/HTML)
+    由前端渲染失败后自动触发
+    """
+    # 1. 获取文档
     result = await db.execute(
-        select(DocumentShare).where(
-            DocumentShare.document_id == doc_id,
-            DocumentShare.to_user_id == user.id,
-            DocumentShare.deleted_at.is_(None),
-        )
+        select(Document)
+        .where(Document.id == doc_id)
+        .options(selectinload(Document.versions))
     )
-    share = result.scalar_one_or_none()
-    if not share:
-        raise HTTPException(status_code=404, detail="抄送记录不存在")
-    share.deleted_at = datetime.utcnow()
-    await db.commit()
-    return {"ok": True}
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="文档不存在")
+        
+    # 2. 获取最新版本内容
+    sorted_versions = sorted(doc.versions, key=lambda v: v.created_at, reverse=True) if doc.versions else []
+    latest_version = sorted_versions[0] if sorted_versions else None
+    
+    if not latest_version:
+        raise HTTPException(status_code=400, detail="文档内容为空")
+        
+    content_md = latest_version.content_md
+    
+    # 3. 调用修复节点
+    fixed_md = await run_repair(content_md, req.errors)
+    
+    # 4. 如果内容有变化，保存新版本
+    if fixed_md != content_md:
+        new_version = DocumentVersion(
+            document_id=doc_id,
+            content_md=fixed_md,
+            doc_variables=latest_version.doc_variables, # 继承变量
+        )
+        db.add(new_version)
+        await db.commit()
+        await db.refresh(new_version)
+        
+        # 重新加载文档以返回最新状态
+        await db.refresh(doc)
+        # 手动更新 doc.latest_version (因为 selectinload 可能缓存)
+        doc.versions.append(new_version) 
+        
+    return doc
+
 
